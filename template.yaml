@@ -72,6 +72,7 @@ Resources:
           - PUT
           - DELETE
           - OPTIONS
+        AllowCredentials: false
         MaxAge: 600
       Description: HTTP API for Message Board
 
