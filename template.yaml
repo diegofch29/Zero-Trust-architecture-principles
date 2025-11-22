@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Secure Message Board Application - Backend API
+
+Parameters:
+  JwtSecret:
+    Type: String
+    Description: JWT Secret Key for token generation
+    NoEcho: true
+    Default: YourSuperSecretKeyForJWTTokenGeneration123!
+
+  JwtIssuer:
+    Type: String
+    Description: JWT Issuer
+    Default: MessageBoardAPI
+
+  JwtAudience:
+    Type: String
+    Description: JWT Audience
+    Default: MessageBoardClient
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+    Runtime: dotnet8
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        JWT_SECRET: !Ref JwtSecret
+        JWT_ISSUER: !Ref JwtIssuer
+        JWT_AUDIENCE: !Ref JwtAudience
+        JWT_EXPIRY_MINUTES: 60
+
+Resources:
+  MessageBoardFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: message-board-api
+      Handler: MessageBackend::MessageBackend.LambdaEntryPoint::FunctionHandlerAsync
+      CodeUri: ./backend/
+      Description: Message Board API with JWT Authentication
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      Events:
+        ProxyResource:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MessageBoardApi
+            Path: /{proxy+}
+            Method: ANY
+        RootResource:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref MessageBoardApi
+            Path: /
+            Method: ANY
+
+  MessageBoardApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: Prod
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        MaxAge: 600
+      Description: HTTP API for Message Board
+
+  MessageBoardFrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "message-board-frontend-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - GET
+              - HEAD
+            AllowedHeaders:
+              - "*"
+
+  MessageBoardFrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MessageBoardFrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: s3:GetObject
+            Resource: !Sub "${MessageBoardFrontendBucket.Arn}/*"
+
+  MessageBoardCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: message-board-app
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt MessageBoardFrontendBucket.DomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          MinTTL: 0
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "message-board-oac-${AWS::StackName}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${MessageBoardApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  LambdaFunctionArn:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt MessageBoardFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunctionArn"
+
+  FrontendBucketName:
+    Description: "S3 Bucket for Frontend"
+    Value: !Ref MessageBoardFrontendBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-FrontendBucket"
+
+  FrontendWebsiteURL:
+    Description: "S3 Website URL"
+    Value: !GetAtt MessageBoardFrontendBucket.WebsiteURL
+    Export:
+      Name: !Sub "${AWS::StackName}-WebsiteURL"
+
+  CloudFrontURL:
+    Description: "CloudFront Distribution URL"
+    Value: !GetAtt MessageBoardCloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontURL"
