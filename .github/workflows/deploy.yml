@@ -44,7 +44,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Build SAM application
-        run: sam build --use-container
+        run: sam build --use-container --mount-with WRITE
 
       - name: Deploy SAM application
         run: |
