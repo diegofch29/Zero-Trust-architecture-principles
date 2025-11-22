@@ -10,15 +10,26 @@ env:
   AWS_REGION: us-east-1
   DOTNET_VERSION: "8.0.x"
   NODE_VERSION: "18.x"
+  SAM_CLI_VERSION: "1.120.0"
 
 jobs:
   deploy-backend:
-    name: Deploy Backend to AWS Lambda
+    name: Deploy Backend using AWS SAM
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          version: ${{ env.SAM_CLI_VERSION }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -32,81 +43,41 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install Lambda tools
-        run: dotnet tool install -g Amazon.Lambda.Tools
+      - name: Build SAM application
+        run: sam build --use-container
 
-      - name: Restore dependencies
-        working-directory: ./backend
-        run: dotnet restore
-
-      - name: Build backend
-        working-directory: ./backend
-        run: dotnet build --configuration Release --no-restore
-
-      - name: Publish backend
-        working-directory: ./backend
-        run: dotnet publish --configuration Release --output ./publish
-
-      - name: Package Lambda function
-        working-directory: ./backend/publish
-        run: zip -r ../lambda-deployment.zip .
-
-      - name: Deploy to Lambda
-        working-directory: ./backend
+      - name: Deploy SAM application
         run: |
-          aws lambda update-function-code \
-            --function-name message-board-api \
-            --zip-file fileb://lambda-deployment.zip \
-            --region ${{ env.AWS_REGION }} || \
-          aws lambda create-function \
-            --function-name message-board-api \
-            --runtime dotnet8 \
-            --role ${{ secrets.AWS_LAMBDA_ROLE_ARN }} \
-            --handler MessageBackend::MessageBackend.LambdaEntryPoint::FunctionHandlerAsync \
-            --zip-file fileb://lambda-deployment.zip \
-            --timeout 30 \
-            --memory-size 512 \
+          sam deploy \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --stack-name message-board-app \
+            --parameter-overrides \
+              JwtSecret="${{ secrets.JWT_SECRET }}" \
+              JwtIssuer=MessageBoardAPI \
+              JwtAudience=MessageBoardClient \
+            --capabilities CAPABILITY_IAM \
             --region ${{ env.AWS_REGION }}
 
-      - name: Update Lambda configuration
+      - name: Get Stack Outputs
+        id: get-outputs
         run: |
-          aws lambda update-function-configuration \
-            --function-name message-board-api \
-            --environment "Variables={JWT_SECRET=${{ secrets.JWT_SECRET }},JWT_ISSUER=MessageBoardAPI,JWT_AUDIENCE=MessageBoardClient,JWT_EXPIRY_MINUTES=60}" \
-            --region ${{ env.AWS_REGION }}
+          API_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name message-board-app \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
 
-      - name: Create or update API Gateway
-        run: |
-          # Check if API exists
-          API_ID=$(aws apigatewayv2 get-apis --query "Items[?Name=='message-board-api'].ApiId" --output text --region ${{ env.AWS_REGION }})
+          BUCKET_NAME=$(aws cloudformation describe-stacks \
+            --stack-name message-board-app \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucketName`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
 
-          if [ -z "$API_ID" ]; then
-            # Create new HTTP API
-            API_ID=$(aws apigatewayv2 create-api \
-              --name message-board-api \
-              --protocol-type HTTP \
-              --target arn:aws:lambda:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:function:message-board-api \
-              --query ApiId --output text \
-              --region ${{ env.AWS_REGION }})
-            
-            echo "Created API Gateway with ID: $API_ID"
-          else
-            echo "Using existing API Gateway: $API_ID"
-          fi
-
-          # Add Lambda permission for API Gateway
-          aws lambda add-permission \
-            --function-name message-board-api \
-            --statement-id apigateway-invoke \
-            --action lambda:InvokeFunction \
-            --principal apigateway.amazonaws.com \
-            --source-arn "arn:aws:execute-api:${{ env.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:$API_ID/*" \
-            --region ${{ env.AWS_REGION }} || true
-
-          # Get API endpoint
-          API_ENDPOINT=$(aws apigatewayv2 get-apis --query "Items[?ApiId=='$API_ID'].ApiEndpoint" --output text --region ${{ env.AWS_REGION }})
           echo "API_ENDPOINT=$API_ENDPOINT" >> $GITHUB_ENV
+          echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_ENV
           echo "Backend API deployed at: $API_ENDPOINT"
+          echo "Frontend bucket: $BUCKET_NAME"
 
   deploy-frontend:
     name: Deploy Frontend to AWS S3
@@ -134,9 +105,22 @@ jobs:
       - name: Get API Gateway endpoint
         id: get-api
         run: |
-          API_ENDPOINT=$(aws apigatewayv2 get-apis --query "Items[?Name=='message-board-api'].ApiEndpoint" --output text --region ${{ env.AWS_REGION }})
+          API_ENDPOINT=$(aws cloudformation describe-stacks \
+            --stack-name message-board-app \
+            --query 'Stacks[0].Outputs[?OutputKey==`ApiEndpoint`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
+
+          BUCKET_NAME=$(aws cloudformation describe-stacks \
+            --stack-name message-board-app \
+            --query 'Stacks[0].Outputs[?OutputKey==`FrontendBucketName`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
+
           echo "API_ENDPOINT=$API_ENDPOINT" >> $GITHUB_ENV
+          echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_ENV
           echo "Backend API endpoint: $API_ENDPOINT"
+          echo "Frontend bucket: $BUCKET_NAME"
 
       - name: Install dependencies
         working-directory: ./frontend
@@ -148,77 +132,43 @@ jobs:
           REACT_APP_API_URL: ${{ env.API_ENDPOINT }}
         run: npm run build
 
-      - name: Create S3 bucket if not exists
-        run: |
-          aws s3 mb s3://message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }} --region ${{ env.AWS_REGION }} || true
-
-          # Enable static website hosting
-          aws s3 website s3://message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }} \
-            --index-document index.html \
-            --error-document index.html \
-            --region ${{ env.AWS_REGION }}
-
-          # Configure bucket policy for public read
-          aws s3api put-bucket-policy \
-            --bucket message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }} \
-            --policy '{
-              "Version": "2012-10-17",
-              "Statement": [{
-                "Sid": "PublicReadGetObject",
-                "Effect": "Allow",
-                "Principal": "*",
-                "Action": "s3:GetObject",
-                "Resource": "arn:aws:s3:::message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }}/*"
-              }]
-            }' \
-            --region ${{ env.AWS_REGION }}
-
       - name: Deploy to S3
         working-directory: ./frontend
         run: |
-          aws s3 sync build/ s3://message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }} \
+          aws s3 sync build/ s3://${{ env.BUCKET_NAME }} \
             --delete \
             --cache-control "public, max-age=31536000" \
             --region ${{ env.AWS_REGION }}
 
           # Update index.html with no cache
-          aws s3 cp build/index.html s3://message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }}/index.html \
+          aws s3 cp build/index.html s3://${{ env.BUCKET_NAME }}/index.html \
             --cache-control "no-cache" \
             --content-type "text/html" \
             --region ${{ env.AWS_REGION }}
 
-      - name: Create CloudFront distribution
+      - name: Get CloudFront URL and invalidate cache
         id: cloudfront
         run: |
-          # Check if distribution exists
+          CLOUDFRONT_URL=$(aws cloudformation describe-stacks \
+            --stack-name message-board-app \
+            --query 'Stacks[0].Outputs[?OutputKey==`CloudFrontURL`].OutputValue' \
+            --output text \
+            --region ${{ env.AWS_REGION }})
+
           DIST_ID=$(aws cloudfront list-distributions \
             --query "DistributionList.Items[?Comment=='message-board-app'].Id" \
             --output text)
 
-          if [ -z "$DIST_ID" ]; then
-            echo "Creating CloudFront distribution..."
-            
-            DIST_ID=$(aws cloudfront create-distribution \
-              --origin-domain-name message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }}.s3-website-${{ env.AWS_REGION }}.amazonaws.com \
-              --default-root-object index.html \
-              --comment "message-board-app" \
-              --query 'Distribution.Id' \
-              --output text)
-            
-            echo "Created CloudFront distribution: $DIST_ID"
-          else
-            echo "CloudFront distribution already exists: $DIST_ID"
-            
-            # Invalidate cache
+          echo "CLOUDFRONT_URL=https://$CLOUDFRONT_URL" >> $GITHUB_ENV
+          echo "Frontend deployed at: https://$CLOUDFRONT_URL"
+
+          # Invalidate CloudFront cache
+          if [ ! -z "$DIST_ID" ]; then
             aws cloudfront create-invalidation \
               --distribution-id $DIST_ID \
               --paths "/*"
+            echo "Cache invalidated for distribution: $DIST_ID"
           fi
-
-          # Get CloudFront domain
-          CF_DOMAIN=$(aws cloudfront get-distribution --id $DIST_ID --query 'Distribution.DomainName' --output text)
-          echo "Frontend deployed at: https://$CF_DOMAIN"
-          echo "CLOUDFRONT_URL=https://$CF_DOMAIN" >> $GITHUB_ENV
 
       - name: Deployment summary
         run: |
@@ -229,5 +179,8 @@ jobs:
           echo "- **Lambda Function**: message-board-api" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Frontend" >> $GITHUB_STEP_SUMMARY
-          echo "- **S3 Bucket**: message-board-frontend-${{ secrets.AWS_ACCOUNT_ID }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **S3 Bucket**: ${{ env.BUCKET_NAME }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Website URL**: ${{ env.CLOUDFRONT_URL }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Access Your Application" >> $GITHUB_STEP_SUMMARY
+          echo "Open: ${{ env.CLOUDFRONT_URL }}" >> $GITHUB_STEP_SUMMARY
