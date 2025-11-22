@@ -52,6 +52,7 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --stack-name message-board-app \
+            --resolve-s3 \
             --parameter-overrides \
               JwtSecret="${{ secrets.JWT_SECRET }}" \
               JwtIssuer=MessageBoardAPI \
